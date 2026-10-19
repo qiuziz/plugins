@@ -56,6 +56,26 @@ Desktop's sign-in is refreshed only when the app hasn't refreshed it
 itself, and the new token is kept in memory, never written back, as magpie's
 built-in WorkBuddy does.
 
+## Per-account egress (fork)
+
+This fork lets each WorkBuddy account go out through its own proxy. Put
+`~/.config/magpie/workbuddy-proxies.json` next to magpie's config:
+
+```json
+{
+  "default": "direct",
+  "accounts": {
+    "qiuz08408@gmail.com": "direct",
+    "nicco.chu@gmail.com": "http://127.0.0.1:7890",
+    "qiuz19890705@gmail.com": "http://127.0.0.1:7891"
+  }
+}
+```
+
+`direct`/`none`/empty leaves that account as it was; an account not named
+uses `default`. The file is re-read when it changes. Magpie on Bun passes
+the proxy to `fetch`; OpenCode on Node ignores it.
+
 ## Requests
 
 Chats are chat completions (`@ai-sdk/openai-compatible`) at `<API>/chat/completions`.

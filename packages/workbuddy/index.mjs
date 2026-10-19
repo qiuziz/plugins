@@ -9,7 +9,7 @@
 // WorkBuddy/<version> is refused (error 10085).
 
 import { createHash, randomBytes } from "node:crypto"
-import { readFileSync } from "node:fs"
+import { readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -20,6 +20,55 @@ const SIGN_IN_MS = 5 * 60 * 1000
 const EARLY_MS = 60 * 1000 // a token this close to its end is refreshed before a request
 const LEAD_MS = 5 * 60 * 1000 // and this close, magpie renews it ahead of time (auth.refresh)
 const KEEP_RENEWED_MS = 60 * 1000 // how long a refresh's result answers for the old refresh token
+
+// ---- per-account egress ------------------------------------------------------
+// A proxy per WorkBuddy account lives in ~/.config/magpie/workbuddy-proxies.json:
+//   { "default": "direct",
+//     "accounts": { "a@example.com": "http://127.0.0.1:7890", ... } }
+// "direct"/"none"/"" leaves the request as it was; a missing account uses
+// "default". The file is read again when it changes, so no restart is needed.
+const PROXY_FILE = join(homedir(), ".config", "magpie", "workbuddy-proxies.json")
+const proxyStates = new Map()
+const proxyLogged = new Set()
+
+function proxyConfig(file) {
+  let st
+  try {
+    st = statSync(file)
+  } catch {
+    proxyStates.delete(file)
+    return { map: null, fallback: undefined }
+  }
+  const old = proxyStates.get(file)
+  if (old && old.mtimeMs === st.mtimeMs) return old
+  let map = null
+  let fallback
+  try {
+    const raw = JSON.parse(readFileSync(file, "utf8"))
+    if (raw && typeof raw === "object") {
+      map = raw.accounts && typeof raw.accounts === "object" ? raw.accounts : raw
+      fallback = raw.default
+    }
+  } catch {}
+  const next = { mtimeMs: st.mtimeMs, map, fallback }
+  proxyStates.set(file, next)
+  return next
+}
+
+function proxyFor(a, file = PROXY_FILE) {
+  if (!a) return undefined
+  const cfg = proxyConfig(file)
+  const found = cfg.map?.[a.accountId] ?? cfg.map?.[a.uid] ?? cfg.fallback
+  const value = found && typeof found === "object" ? found.proxy : found
+  if (!value || value === "direct" || value === "none") return undefined
+  const proxy = String(value)
+  const who = String(a.accountId || a.uid || "?")
+  if (process.env.MAGPIE_WORKBUDDY_PROXY_DEBUG && !proxyLogged.has(who + "|" + proxy)) {
+    proxyLogged.add(who + "|" + proxy)
+    console.error(`[workbuddy] ${who} via ${proxy}`)
+  }
+  return proxy
+}
 
 // [id, name, context, efforts]
 const CN_MODELS = [
@@ -116,7 +165,7 @@ class WBError extends Error {
 
 // call makes a request of WorkBuddy's plugin API, which answers
 // {code, msg, data}; a code but 0 is an error.
-async function call(site, method, path, headers = {}, body) {
+async function call(site, method, path, headers = {}, body, proxy) {
   const res = await fetch(site.endpoint + path, {
     method,
     headers: {
@@ -127,6 +176,7 @@ async function call(site, method, path, headers = {}, body) {
     },
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(30000),
+    ...(proxy ? { proxy } : {}),
   })
   const text = await res.text()
   let env = {}
@@ -191,7 +241,7 @@ function renew(site, a, save) {
         "X-Auth-Refresh-Source": "plugin",
         "X-Domain": domainOf(site, a),
         ...enterpriseHeaders(a),
-      }, {})
+      }, {}, proxyFor(a))
       if (!got?.accessToken) throw Object.assign(new Error("WorkBuddy gave no refreshed token"), { bare: true })
       const next = merge(a, got)
       renewed.set(key, { next, at: Date.now() })
@@ -309,7 +359,7 @@ async function enterpriseOf(site, a, who) {
     list = await call(site, "GET", "/v2/plugin/accounts", {
       Authorization: "Bearer " + a.access,
       "X-Domain": domainOf(site, a),
-    })
+    }, undefined, proxyFor(a))
   } catch {
     return ""
   }
@@ -1138,6 +1188,7 @@ const statusText = (n) => STATUS_TEXT[n] || `HTTP ${n}`
 
 // meterAsked is the billing API's reply to path, asked with a's sign-in.
 function meterAsked(site, a, path, body = {}, signal = AbortSignal.timeout(20000)) {
+  const proxy = proxyFor(a)
   return fetch(site.endpoint + path, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": "WorkBuddy/" + UA_VERSION,
@@ -1145,6 +1196,7 @@ function meterAsked(site, a, path, body = {}, signal = AbortSignal.timeout(20000
       "X-IDE-Type": "WorkBuddy", ...enterpriseHeaders(a) },
     body: JSON.stringify(body),
     signal,
+    ...(proxy ? { proxy } : {}),
   })
 }
 
@@ -1467,7 +1519,8 @@ async function liveModels(site, a) {
   headers.set("User-Agent", `CLI/${APP_VERSION} WorkBuddy/${UA_VERSION}`)
   headers.set("X-Requested-With", "XMLHttpRequest")
   headers.set("Accept", "application/json")
-  const res = await fetch(site.endpoint + "/v3/config", { headers, signal: AbortSignal.timeout(15000) })
+  const proxy = proxyFor(a)
+  const res = await fetch(site.endpoint + "/v3/config", { headers, signal: AbortSignal.timeout(15000), ...(proxy ? { proxy } : {}) })
   const env = await res.json().catch(() => ({}))
   if (!res.ok) throw new Error(`${site.name}'s config: HTTP ${res.status}`)
   if (env.code) throw new Error(`${site.name}'s config: ${env.msg} (${env.code})`)
@@ -1605,8 +1658,9 @@ function makePlugin(site) {
             const fit = fitted(body)
             body = normalizeToolChoice(fit.body)
             attend(headers, body, session)
+            const proxy = proxyFor(a)
             const send = (b) =>
-              fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body: b }).catch((e) => unanswered(site, a, b, e, init?.signal))
+              fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body: b, ...(proxy ? { proxy } : {}) }).catch((e) => unanswered(site, a, b, e, init?.signal))
             // a model known to turn tool results then the user's message away
             // gets the empty reply between them up front (see endsAfterTools)
             const model = chatOf(body)?.model
@@ -1762,4 +1816,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf }
+export const _internal = { EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf, proxyFor }
