@@ -368,6 +368,23 @@ function sign(site, a, headers) {
   for (const [k, v] of Object.entries(enterpriseHeaders(a))) headers.set(k, v)
 }
 
+// rawSign sets only what binds the request to the account: the sign-in in
+// Authorization, the uid it belongs to, and the domain it was signed in on
+// (a key's own header instead, as sign does). Everything else the client
+// sent — its User-Agent, X-IDE-*, X-Agent-*, its own ids — stays as it
+// came, for RAW's route.
+function rawSign(site, a, headers) {
+  headers.set("Authorization", "Bearer " + a.access)
+  headers.set("X-User-Id", a.uid ?? "")
+  if (a.source === "key") {
+    headers.set("X-API-Key", a.key)
+    headers.delete("X-Domain")
+  } else {
+    headers.delete("X-API-Key")
+    headers.set("X-Domain", domainOf(site, a))
+  }
+}
+
 // cliAgent is the User-Agent WorkBuddy's desktop CLI sends its API calls
 // (a chat, the product config) with: UserAgentHttpInterceptor's
 // buildUserAgent puts the platform (CLIENT_INFO_PLATFORM "WorkBuddy", at
@@ -3784,6 +3801,15 @@ const FREE_ONLY = "free_only"
 // read again: a promotion that ends stops counting as free within it.
 const PRICE_TTL = 60_000
 
+// RAW is the switch that sends a request as its client made it: the
+// account's sign-in in the three headers that bind it, and the headers and
+// bytes the client sent otherwise untouched. It is for magpie's raw route,
+// which hands the client's own request here (a client on any other route
+// keeps the rewrites below). Only the account is the plugin's: User-Agent,
+// X-IDE-*, X-Agent-* and the body stay the client's, and none of the chat
+// rewrites, the default effort, or the gzip run.
+const RAW = "raw"
+
 // notFree is the answer to a request the switch keeps from WorkBuddy. Its
 // words say the model, not the account, is what is turned away, so magpie
 // rests that model alone and asks another provider of it; they name no
@@ -3845,6 +3871,9 @@ function makePlugin(site) {
     }
   }
   const freeOnly = () => magpie?.option?.(site.id, FREE_ONLY) === true
+  // rawOn is the switch that sends the client's request as it came (RAW):
+  // off unless the user turned it on, so an ordinary route keeps its work
+  const rawOn = () => magpie?.option?.(site.id, RAW) === true
   // on by default: magpie hands over the user's value, else the default;
   // OpenCode, with no magpie, has it on
   const dshOff = () => magpie?.option?.(site.id, HIDE_DSH) !== false
@@ -3970,6 +3999,18 @@ function makePlugin(site) {
             de: `Entfernt den Namen von DeepSeek Harness aus dem, was an ${site.name} gesendet wird: die erste Zeile sowie die Zeilen zu seinem Checkout und seiner Web-GUI. Pfade, Befehle und Tools bleiben unverändert.`,
           },
         },
+        {
+          key: RAW,
+          label: "Send requests as the client made them",
+          description: `Signs a request with the account alone — Authorization, X-User-Id and X-Domain — and sends its headers and body as the client made them: no WorkBuddy User-Agent or X-IDE-*/X-Agent-* headers, no chat rewrite, no gzip. For magpie's raw route, where the client's own request is passed through.`,
+          labels: { zh: "按客户端的原样发送", "zh-TW": "依客戶端的原樣傳送", ja: "クライアントのまま送る", de: "Anfragen so senden, wie der Client sie stellt" },
+          descriptions: {
+            zh: `只用账号签名（Authorization、X-User-Id、X-Domain），请求头和请求体按客户端原样发送：不覆盖 WorkBuddy 的 User-Agent、X-IDE-*、X-Agent-*，不改写 chat，也不压缩。用于 magpie 的 raw 路由：客户端的请求原样透传。`,
+            "zh-TW": `只用帳號簽名（Authorization、X-User-Id、X-Domain），請求標頭與內文依客戶端原樣傳送：不覆寫 WorkBuddy 的 User-Agent、X-IDE-*、X-Agent-*，不改寫 chat，也不壓縮。用於 magpie 的 raw 路由：客戶端的請求原樣透傳。`,
+            ja: `アカウントの署名（Authorization、X-User-Id、X-Domain）だけを付け、ヘッダーと本文はクライアントが作ったまま送ります。WorkBuddy の User-Agent、X-IDE-*、X-Agent-* に書き換えず、chat の書き換えも gzip も行いません。magpie の raw ルート用です。`,
+            de: `Signiert eine Anfrage nur mit dem Konto (Authorization, X-User-Id, X-Domain) und sendet Kopfzeilen und Rumpf so, wie der Client sie erstellt hat: kein WorkBuddy-User-Agent, keine X-IDE-*/X-Agent-*-Kopfzeilen, keine Chat-Umschreibung, kein gzip. Für magpies Raw-Route, die die Anfrage des Clients unverändert weitergibt.`,
+          },
+        },
       ],
       async loader(getAuth) {
         const auth = await getAuth()
@@ -3991,9 +4032,20 @@ function makePlugin(site) {
             headers.delete("x-api-key")
             headers.delete("content-length")
             const session = sessionOf(headers)
-            sign(site, a, headers)
             let body = init?.body
             if (body === undefined && req) body = await req.clone().text()
+            // RAW: the client's own request goes out, the account's three
+            // headers the only thing this plugin sets. Nothing below runs:
+            // no sign's client headers, no prepared rewrites, no default
+            // effort, no attend's ids, no gzip, and no 401 reissue (the
+            // account was renewed above, before it was picked). magpie's
+            // raw route says so in X-Magpie-Raw, which never goes on.
+            if (rawOn() || headers.get("x-magpie-raw") === "1") {
+              headers.delete("x-magpie-raw")
+              rawSign(site, a, headers)
+              return fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body })
+            }
+            sign(site, a, headers)
             // An Anthropic request goes as the agent sent it: WorkBuddy
             // serves these models on Messages itself, and the rewrites
             // below (a default system message, the chat endpoint's
